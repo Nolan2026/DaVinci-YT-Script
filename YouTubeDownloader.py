@@ -1,5 +1,5 @@
 """
-YouTube -> DaVinci Resolve  (v3)
+YouTube / Instagram -> DaVinci Resolve  (v4)
 
 Install:
   1. pip install -U yt-dlp   (same Python that Resolve uses)
@@ -10,11 +10,10 @@ Install:
        Linux:   ~/.local/share/DaVinciResolve/Fusion/Scripts/Utility
   4. Run from Resolve: Workspace > Scripts > YouTubeDownloader
 
-What's new in v3:
-  - Modern dark dialog, resolution picker as buttons (no dropdown)
-  - Browse... folder picker + the folder is remembered for next runs
-  - Live progress bar + percentage while downloading
-  - Downloads run on a worker thread so the window never freezes
+What's new in v4:
+  - Instagram tab: paste a Reel / post URL and download directly
+  - YouTube tab unchanged (resolution picker, cookies, timeline import)
+  - Tab switcher in the header
 """
 
 import os
@@ -96,15 +95,25 @@ def default_download_dir():
     return path
 
 
-# ------------------------------------------------------------------ download
+def default_insta_dir():
+    saved = load_settings().get("insta_out_dir")
+    if saved and os.path.isdir(saved):
+        return saved
+    path = os.path.join(os.path.expanduser("~"), "Downloads", "ResolveInstagram")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        path = tempfile.gettempdir()
+    return path
+
+
+# ------------------------------------------------------------------ helpers
 
 def _find_node():
-    """Return the path to node.exe / node, or None."""
     import shutil
     found = shutil.which("node") or shutil.which("node.exe")
     if found:
         return found
-    # Common Windows location even when not on PATH
     candidates = [
         r"C:\Program Files\nodejs\node.exe",
         r"C:\Program Files (x86)\nodejs\node.exe",
@@ -117,19 +126,16 @@ def _find_node():
 
 
 def _find_ffmpeg():
-    """Return the path to ffmpeg.exe / ffmpeg, or None."""
     import shutil
     found = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if found:
         return found
-    # Common locations
     candidates = [
         r"C:\ffmpeg\bin\ffmpeg.exe",
         r"C:\ffmpeg\ffmpeg.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Programs\ffmpeg\bin\ffmpeg.exe"),
         os.path.expandvars(r"%PROGRAMFILES%\ffmpeg\bin\ffmpeg.exe"),
         os.path.expandvars(r"%PROGRAMFILES(x86)%\ffmpeg\bin\ffmpeg.exe"),
-        # winget (Gyan.FFmpeg) install path
         os.path.expandvars(
             r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"
             r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
@@ -144,7 +150,6 @@ def _find_ffmpeg():
 
 def format_selector(choice, has_ffmpeg=True):
     if not has_ffmpeg:
-        # Without ffmpeg we can't merge; grab the best single pre-merged file
         if choice == "Best":
             return "best"
         height = choice.replace("p", "")
@@ -155,26 +160,14 @@ def format_selector(choice, has_ffmpeg=True):
     return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
 
 
-
 def _find_ytdlp_cmd():
-    """Return the best available command to invoke yt-dlp.
-
-    Resolve's embedded Python may not have yt-dlp installed, so we:
-    1. Try a standalone  yt-dlp / yt-dlp.exe  on PATH.
-    2. Try common system Python locations that have yt-dlp.
-    3. Fall back to sys.executable as a last resort.
-    """
     import shutil
-
-    # 1. standalone yt-dlp binary on PATH
     ytdlp_bin = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
     if ytdlp_bin:
         return [ytdlp_bin]
 
-    # 2. Look for a system Python that can import yt_dlp
     candidates = []
     if sys.platform.startswith("win"):
-        # Common Windows locations
         for base in [
             os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python"),
             os.path.expandvars(r"%PROGRAMFILES%\Python"),
@@ -186,7 +179,6 @@ def _find_ytdlp_cmd():
                     py = os.path.join(base, entry, "python.exe")
                     if os.path.isfile(py):
                         candidates.append(py)
-        # Also try PATH pythons
         for name in ("python", "python3", "python3.11", "python3.12"):
             p = shutil.which(name)
             if p and p not in candidates:
@@ -204,7 +196,7 @@ def _find_ytdlp_cmd():
     creation = 0x08000000 if sys.platform.startswith("win") else 0
     for py in candidates:
         if py == sys.executable:
-            continue  # skip Resolve's own Python
+            continue
         try:
             ret = subprocess.run(
                 [py, "-c", probe],
@@ -218,34 +210,30 @@ def _find_ytdlp_cmd():
         except Exception:
             continue
 
-    # 3. last resort – current interpreter (may or may not work)
     return [sys.executable, "-m", "yt_dlp"]
 
+
+# ------------------------------------------------------------------ YouTube download
 
 def yt_dlp_command(url, choice, out_dir):
     template = os.path.join(out_dir, "%(title).80s [%(id)s].%(ext)s")
     cmd_prefix = _find_ytdlp_cmd()
-
-    node = _find_node()
+    node   = _find_node()
     ffmpeg = _find_ffmpeg()
 
     cmd = [*cmd_prefix]
 
-    # JavaScript runtime + EJS challenge solver – required for YouTube n-challenge (fixes 403)
     if node:
         cmd += ["--js-runtimes", f"node:{node}"]
         cmd += ["--remote-components", "ejs:github"]
 
-    # ffmpeg – required for merging separate video+audio streams
     if ffmpeg:
         cmd += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
         cmd += ["-f", format_selector(choice, has_ffmpeg=True)]
         cmd += ["--merge-output-format", "mp4"]
     else:
-        # No ffmpeg: fall back to a pre-merged single-file format
         cmd += ["-f", format_selector(choice, has_ffmpeg=False)]
 
-    # cookies.txt – fixes 429 / bot-check errors
     cookies_file = load_settings().get("cookies_file", "")
     if cookies_file and os.path.isfile(cookies_file):
         cmd += ["--cookies", cookies_file]
@@ -263,11 +251,44 @@ def yt_dlp_command(url, choice, out_dir):
     return cmd
 
 
+# ------------------------------------------------------------------ Instagram download
+
+def insta_dlp_command(url, out_dir):
+    """yt-dlp command for Instagram Reels / posts — no quality picker, no cookies."""
+    template = os.path.join(out_dir, "%(uploader)s_%(id)s.%(ext)s")
+    cmd_prefix = _find_ytdlp_cmd()
+    ffmpeg = _find_ffmpeg()
+
+    cmd = [*cmd_prefix]
+
+    if ffmpeg:
+        cmd += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
+        cmd += ["-f", "bestvideo+bestaudio/best"]
+        cmd += ["--merge-output-format", "mp4"]
+    else:
+        cmd += ["-f", "best"]
+
+    cmd += [
+        "--restrict-filenames",
+        "--force-overwrites",
+        "--newline",
+        "--print", "after_move:filepath",
+        "--no-simulate",
+        "-o", template,
+        url,
+    ]
+    return cmd
+
+
 PCT_RE = re.compile(r"\[download\]\s+([\d.]+)%")
 
 
-def download(url, choice, out_dir, log, progress=None):
-    cmd = yt_dlp_command(url, choice, out_dir)
+def download(url, choice, out_dir, log, progress=None, platform="youtube"):
+    if platform == "instagram":
+        cmd = insta_dlp_command(url, out_dir)
+    else:
+        cmd = yt_dlp_command(url, choice, out_dir)
+
     log("Downloading: " + url)
     creation = 0x08000000 if sys.platform.startswith("win") else 0
     proc = subprocess.Popen(
@@ -304,8 +325,6 @@ def download(url, choice, out_dir, log, progress=None):
 
 
 def get_resolve_handles():
-    """Grab fresh handles every time - cached ones go stale when the user
-    switches project/page, which silently breaks the import."""
     r = resolve
     if r is None:
         try:
@@ -379,15 +398,18 @@ def import_to_resolve(path, add_to_timeline, log):
             log("The clip is in the Media Pool - drag it to the timeline.")
 
 
-def run_job(url, choice, out_dir, to_timeline, log, progress=None):
+def run_job(url, choice, out_dir, to_timeline, log, progress=None, platform="youtube"):
     try:
         if not url:
             log("Please paste a video URL first.")
             return
-        out_dir = out_dir or default_download_dir()
+        out_dir = out_dir or (default_insta_dir() if platform == "instagram" else default_download_dir())
         os.makedirs(out_dir, exist_ok=True)
-        save_settings(out_dir=out_dir, resolution=choice, to_timeline=bool(to_timeline))
-        path = download(url, choice, out_dir, log, progress)
+        if platform == "youtube":
+            save_settings(out_dir=out_dir, resolution=choice, to_timeline=bool(to_timeline))
+        else:
+            save_settings(insta_out_dir=out_dir)
+        path = download(url, choice, out_dir, log, progress, platform=platform)
         import_to_resolve(path, to_timeline, log)
         log("Done.")
     except Exception as exc:
@@ -400,9 +422,11 @@ CARD    = "#1b1e26"
 FIELD   = "#0e1015"
 TEXT    = "#e8eaf0"
 MUTED   = "#8b93a7"
-ACCENT  = "#ff2d55"
+ACCENT  = "#ff2d55"       # YouTube / active tab
+INSTA   = "#c13584"       # Instagram gradient mid
 ACCENT2 = "#ff5b7a"
 BORDER  = "#2a2f3b"
+TAB_ACT = "#1f2330"       # active tab bg
 
 
 def run_tk_ui():
@@ -416,11 +440,12 @@ def run_tk_ui():
     settings = load_settings()
 
     root = tk.Tk()
-    root.title("YouTube  ->  DaVinci Resolve")
+    root.title("YouTube / Instagram  ->  DaVinci Resolve")
     root.configure(bg=BG)
-    root.geometry("720x620")
-    root.minsize(660, 560)
+    root.geometry("740x680")
+    root.minsize(680, 600)
 
+    # ---------------------------------------------------------------- helpers
     def card(parent, **kw):
         return tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
                         highlightthickness=1, **kw)
@@ -429,32 +454,85 @@ def run_tk_ui():
         return tk.Label(parent, text=text, bg=bg, fg=color,
                         font=("Segoe UI", size, "bold" if bold else "normal"))
 
-    # ---- header
+    # ---------------------------------------------------------------- header
     header = tk.Frame(root, bg=BG)
-    header.pack(fill="x", padx=22, pady=(20, 8))
-    tk.Label(header, text="YouTube Downloader", bg=BG, fg=TEXT,
+    header.pack(fill="x", padx=22, pady=(18, 0))
+
+    tk.Label(header, text="Media Downloader", bg=BG, fg=TEXT,
              font=("Segoe UI", 18, "bold")).pack(anchor="w")
-    tk.Label(header, text="Grab a video and drop it straight into your project",
+    tk.Label(header, text="Download from YouTube or Instagram into your project",
              bg=BG, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w")
 
-    body = card(root)
-    body.pack(fill="both", expand=True, padx=22, pady=(6, 18))
-    inner = tk.Frame(body, bg=CARD)
-    inner.pack(fill="both", expand=True, padx=18, pady=16)
+    # ---------------------------------------------------------------- TAB BAR
+    tab_bar = tk.Frame(root, bg=BG)
+    tab_bar.pack(fill="x", padx=22, pady=(14, 0))
 
-    # ---- URL
-    label(inner, "VIDEO URL", size=8, bold=True).pack(anchor="w")
-    url_var = tk.StringVar()
-    url_entry = tk.Entry(inner, textvariable=url_var, bg=FIELD, fg=TEXT,
-                         insertbackground=ACCENT, relief="flat",
-                         font=("Segoe UI", 11), highlightthickness=1,
-                         highlightbackground=BORDER, highlightcolor=ACCENT)
-    url_entry.pack(fill="x", ipady=7, pady=(4, 14))
-    url_entry.focus_set()
+    active_tab = {"name": "youtube"}   # mutable state
 
-    # ---- resolution buttons
-    label(inner, "RESOLUTION", size=8, bold=True).pack(anchor="w")
-    res_row = tk.Frame(inner, bg=CARD)
+    tab_yt_btn  = None
+    tab_ig_btn  = None
+
+    def paint_tabs():
+        for name, btn, accent_col in [
+            ("youtube",   tab_yt_btn,  ACCENT),
+            ("instagram", tab_ig_btn,  INSTA),
+        ]:
+            on = active_tab["name"] == name
+            btn.config(
+                bg=TAB_ACT if on else BG,
+                fg=accent_col if on else MUTED,
+                relief="flat",
+                highlightbackground=accent_col if on else BORDER,
+                highlightthickness=2 if on else 1,
+            )
+
+    def switch_tab(name):
+        active_tab["name"] = name
+        paint_tabs()
+        if name == "youtube":
+            insta_frame.pack_forget()
+            yt_frame.pack(fill="both", expand=True, padx=22, pady=(8, 18))
+        else:
+            yt_frame.pack_forget()
+            insta_frame.pack(fill="both", expand=True, padx=22, pady=(8, 18))
+
+    tab_yt_btn = tk.Button(
+        tab_bar, text="▶  YouTube", cursor="hand2",
+        font=("Segoe UI", 10, "bold"), padx=18, pady=8,
+        activebackground=TAB_ACT, activeforeground=ACCENT,
+        bd=0, highlightthickness=1,
+        command=lambda: switch_tab("youtube")
+    )
+    tab_yt_btn.pack(side="left", padx=(0, 6))
+
+    tab_ig_btn = tk.Button(
+        tab_bar, text="📷  Instagram", cursor="hand2",
+        font=("Segoe UI", 10, "bold"), padx=18, pady=8,
+        activebackground=TAB_ACT, activeforeground=INSTA,
+        bd=0, highlightthickness=1,
+        command=lambda: switch_tab("instagram")
+    )
+    tab_ig_btn.pack(side="left")
+
+    # ================================================================ YOUTUBE FRAME
+    yt_frame = card(root)
+
+    yt_inner = tk.Frame(yt_frame, bg=CARD)
+    yt_inner.pack(fill="both", expand=True, padx=18, pady=16)
+
+    # -- URL
+    label(yt_inner, "VIDEO URL", size=8, bold=True).pack(anchor="w")
+    yt_url_var = tk.StringVar()
+    yt_url_entry = tk.Entry(yt_inner, textvariable=yt_url_var, bg=FIELD, fg=TEXT,
+                            insertbackground=ACCENT, relief="flat",
+                            font=("Segoe UI", 11), highlightthickness=1,
+                            highlightbackground=BORDER, highlightcolor=ACCENT)
+    yt_url_entry.pack(fill="x", ipady=7, pady=(4, 14))
+    yt_url_entry.focus_set()
+
+    # -- Resolution
+    label(yt_inner, "RESOLUTION", size=8, bold=True).pack(anchor="w")
+    res_row = tk.Frame(yt_inner, bg=CARD)
     res_row.pack(fill="x", pady=(6, 16))
 
     chosen = {"res": settings.get("resolution", DEFAULT_RES)}
@@ -484,61 +562,52 @@ def run_tk_ui():
         res_buttons[name] = b
     paint_res()
 
-    # ---- save location
-    label(inner, "SAVE LOCATION", size=8, bold=True).pack(anchor="w")
-    dir_row = tk.Frame(inner, bg=CARD)
-    dir_row.pack(fill="x", pady=(6, 12))
-    dir_var = tk.StringVar(value=default_download_dir())
-    dir_entry = tk.Entry(dir_row, textvariable=dir_var, bg=FIELD, fg=TEXT,
-                         insertbackground=ACCENT, relief="flat",
-                         font=("Segoe UI", 10), highlightthickness=1,
-                         highlightbackground=BORDER, highlightcolor=ACCENT)
-    dir_entry.pack(side="left", fill="x", expand=True, ipady=6)
+    # -- Save location
+    label(yt_inner, "SAVE LOCATION", size=8, bold=True).pack(anchor="w")
+    yt_dir_row = tk.Frame(yt_inner, bg=CARD)
+    yt_dir_row.pack(fill="x", pady=(6, 12))
+    yt_dir_var = tk.StringVar(value=default_download_dir())
+    tk.Entry(yt_dir_row, textvariable=yt_dir_var, bg=FIELD, fg=TEXT,
+             insertbackground=ACCENT, relief="flat",
+             font=("Segoe UI", 10), highlightthickness=1,
+             highlightbackground=BORDER, highlightcolor=ACCENT
+             ).pack(side="left", fill="x", expand=True, ipady=6)
 
-    def browse():
-        start = dir_var.get().strip() or default_download_dir()
-        chosen_dir = filedialog.askdirectory(initialdir=start,
-                                             title="Choose where to save videos")
-        if chosen_dir:
-            dir_var.set(chosen_dir)
-            save_settings(out_dir=chosen_dir)
-            log("Save location set to: " + chosen_dir)
+    def yt_browse():
+        d = filedialog.askdirectory(initialdir=yt_dir_var.get() or default_download_dir(),
+                                    title="Choose where to save YouTube videos")
+        if d:
+            yt_dir_var.set(d)
+            save_settings(out_dir=d)
+            yt_log("Save location set to: " + d)
 
-    def open_folder():
-        p = dir_var.get().strip()
+    def yt_open_folder():
+        p = yt_dir_var.get().strip()
         if not p or not os.path.isdir(p):
-            log("That folder doesn't exist yet.")
+            yt_log("That folder doesn't exist yet.")
             return
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(p)  # type: ignore
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", p])
-            else:
-                subprocess.Popen(["xdg-open", p])
-        except Exception as exc:
-            log("Could not open folder: %s" % exc)
+        _open_folder(p)
 
-    tk.Button(dir_row, text="Browse…", command=browse, relief="flat", bd=0,
+    tk.Button(yt_dir_row, text="Browse…", command=yt_browse, relief="flat", bd=0,
               cursor="hand2", bg=FIELD, fg=TEXT, padx=14, pady=6,
               activebackground=BORDER, activeforeground=TEXT,
               font=("Segoe UI", 10)).pack(side="left", padx=(8, 0))
-    tk.Button(dir_row, text="Open", command=open_folder, relief="flat", bd=0,
+    tk.Button(yt_dir_row, text="Open", command=yt_open_folder, relief="flat", bd=0,
               cursor="hand2", bg=FIELD, fg=MUTED, padx=12, pady=6,
               activebackground=BORDER, activeforeground=TEXT,
               font=("Segoe UI", 10)).pack(side="left", padx=(6, 0))
 
-    # ---- cookies file (fixes 429 / bot-check)
-    label(inner, "COOKIES FILE  (optional — fixes 429 / bot errors)",
+    # -- Cookies
+    label(yt_inner, "COOKIES FILE  (optional — fixes 429 / bot errors)",
           size=8, bold=True).pack(anchor="w", pady=(8, 0))
-    cookie_row = tk.Frame(inner, bg=CARD)
+    cookie_row = tk.Frame(yt_inner, bg=CARD)
     cookie_row.pack(fill="x", pady=(4, 10))
     cookie_var = tk.StringVar(value=settings.get("cookies_file", ""))
-    cookie_entry = tk.Entry(cookie_row, textvariable=cookie_var, bg=FIELD, fg=TEXT,
-                            insertbackground=ACCENT, relief="flat",
-                            font=("Segoe UI", 9), highlightthickness=1,
-                            highlightbackground=BORDER, highlightcolor=ACCENT)
-    cookie_entry.pack(side="left", fill="x", expand=True, ipady=5)
+    tk.Entry(cookie_row, textvariable=cookie_var, bg=FIELD, fg=TEXT,
+             insertbackground=ACCENT, relief="flat",
+             font=("Segoe UI", 9), highlightthickness=1,
+             highlightbackground=BORDER, highlightcolor=ACCENT
+             ).pack(side="left", fill="x", expand=True, ipady=5)
 
     def browse_cookies():
         path = filedialog.askopenfilename(
@@ -548,12 +617,12 @@ def run_tk_ui():
         if path:
             cookie_var.set(path)
             save_settings(cookies_file=path)
-            log("Cookies file set: " + path)
+            yt_log("Cookies file set: " + path)
 
     def clear_cookies():
         cookie_var.set("")
         save_settings(cookies_file="")
-        log("Cookies file cleared.")
+        yt_log("Cookies file cleared.")
 
     tk.Button(cookie_row, text="Select…", command=browse_cookies, relief="flat", bd=0,
               cursor="hand2", bg=FIELD, fg=TEXT, padx=10, pady=5,
@@ -564,11 +633,12 @@ def run_tk_ui():
               activebackground=BORDER, activeforeground=TEXT,
               font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
 
-    action_row = tk.Frame(inner, bg=CARD)
-    action_row.pack(fill="x", pady=(0, 14))
+    # -- Action row
+    yt_action = tk.Frame(yt_inner, bg=CARD)
+    yt_action.pack(fill="x", pady=(0, 14))
 
     tl_var = tk.BooleanVar(value=bool(settings.get("to_timeline", True)))
-    tk.Checkbutton(action_row, text="  Also append to current timeline",
+    tk.Checkbutton(yt_action, text="  Also append to current timeline",
                    variable=tl_var, bg=CARD, fg=TEXT, selectcolor=FIELD,
                    activebackground=CARD, activeforeground=TEXT, bd=0,
                    highlightthickness=0, anchor="w",
@@ -576,72 +646,220 @@ def run_tk_ui():
                    command=lambda: save_settings(to_timeline=tl_var.get())
                    ).pack(side="left")
 
-    tk.Button(action_row, text="Close", command=root.destroy, relief="flat",
+    tk.Button(yt_action, text="Close", command=root.destroy, relief="flat",
               bd=0, cursor="hand2", bg=CARD, fg=MUTED, padx=16, pady=9,
               activebackground=CARD, activeforeground=TEXT,
               font=("Segoe UI", 10)).pack(side="right", padx=(8, 0))
 
-    go_btn = tk.Button(action_row, text="Download & Add", relief="flat", bd=0,
-                       cursor="hand2", bg=ACCENT, fg="#ffffff", padx=22, pady=9,
-                       activebackground=ACCENT2, activeforeground="#ffffff",
-                       font=("Segoe UI", 10, "bold"))
-    go_btn.pack(side="right")
+    yt_go_btn = tk.Button(yt_action, text="Download & Add", relief="flat", bd=0,
+                          cursor="hand2", bg=ACCENT, fg="#ffffff", padx=22, pady=9,
+                          activebackground=ACCENT2, activeforeground="#ffffff",
+                          font=("Segoe UI", 10, "bold"))
+    yt_go_btn.pack(side="right")
 
-    # ---- progress
-    prog_wrap = tk.Frame(inner, bg=FIELD, height=6,
-                         highlightbackground=BORDER, highlightthickness=1)
-    prog_wrap.pack(fill="x")
-    prog_wrap.pack_propagate(False)
-    prog_bar = tk.Frame(prog_wrap, bg=ACCENT, width=0)
-    prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
+    # -- Progress
+    yt_prog_wrap = tk.Frame(yt_inner, bg=FIELD, height=6,
+                            highlightbackground=BORDER, highlightthickness=1)
+    yt_prog_wrap.pack(fill="x")
+    yt_prog_wrap.pack_propagate(False)
+    yt_prog_bar = tk.Frame(yt_prog_wrap, bg=ACCENT, width=0)
+    yt_prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
 
-    status_var = tk.StringVar(value="Ready")
-    tk.Label(inner, textvariable=status_var, bg=CARD, fg=MUTED,
-             font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 10))
+    yt_status_var = tk.StringVar(value="Ready")
+    tk.Label(yt_inner, textvariable=yt_status_var, bg=CARD, fg=MUTED,
+             font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 4))
 
-    def set_progress(pct):
-        prog_bar.place_configure(relwidth=max(0.0, min(pct, 100.0)) / 100.0)
-        status_var.set("Downloading… %.1f%%" % pct)
+    def yt_set_progress(pct):
+        yt_prog_bar.place_configure(relwidth=max(0.0, min(pct, 100.0)) / 100.0)
+        yt_status_var.set("Downloading… %.1f%%" % pct)
 
-    # ---- log
-    log_box = tk.Text(inner, height=9, bg=FIELD, fg="#b9c0d0", bd=0,
-                      relief="flat", font=("Consolas", 9),
-                      insertbackground=ACCENT, highlightthickness=1,
-                      highlightbackground=BORDER, wrap="word")
-    log_box.pack(fill="both", expand=True)
+    # -- Log
+    yt_log_box = tk.Text(yt_inner, height=7, bg=FIELD, fg="#b9c0d0", bd=0,
+                         relief="flat", font=("Consolas", 9),
+                         insertbackground=ACCENT, highlightthickness=1,
+                         highlightbackground=BORDER, wrap="word")
+    yt_log_box.pack(fill="both", expand=True)
 
-    def log(msg):
-        log_box.insert("end", str(msg) + "\n")
-        log_box.see("end")
+    def yt_log(msg):
+        yt_log_box.insert("end", str(msg) + "\n")
+        yt_log_box.see("end")
 
-    def start():
-        url = url_var.get().strip()
-        out_dir = dir_var.get().strip()
+    def yt_start():
+        url = yt_url_var.get().strip()
+        out_dir = yt_dir_var.get().strip()
         if not url:
-            status_var.set("Paste a YouTube URL first")
-            log("Please paste a video URL first.")
+            yt_status_var.set("Paste a YouTube URL first")
+            yt_log("Please paste a video URL first.")
             return
-        go_btn.config(state="disabled", bg=BORDER, text="Working…")
-        set_progress(0.0)
+        yt_go_btn.config(state="disabled", bg=BORDER, text="Working…")
+        yt_set_progress(0.0)
         res, to_tl = chosen["res"], tl_var.get()
 
         def finish():
-            go_btn.config(state="normal", bg=ACCENT, text="Download & Add")
-            status_var.set("Ready")
+            yt_go_btn.config(state="normal", bg=ACCENT, text="Download & Add")
+            yt_status_var.set("Ready")
 
         def worker():
             run_job(url, res, out_dir, to_tl,
-                    lambda m: root.after(0, log, m),
-                    lambda p: root.after(0, set_progress, p))
+                    lambda m: root.after(0, yt_log, m),
+                    lambda p: root.after(0, yt_set_progress, p),
+                    platform="youtube")
             root.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    go_btn.config(command=start)
-    root.bind("<Return>", lambda e: start())
+    yt_go_btn.config(command=yt_start)
+    yt_log("Saving to: " + yt_dir_var.get())
 
-    log("Saving to: " + dir_var.get())
+    # ================================================================ INSTAGRAM FRAME
+    insta_frame = card(root)
+
+    ig_inner = tk.Frame(insta_frame, bg=CARD)
+    ig_inner.pack(fill="both", expand=True, padx=18, pady=16)
+
+    # -- Header note
+    tk.Label(ig_inner,
+             text="📷  Paste an Instagram Reel, post, or story URL below",
+             bg=CARD, fg=MUTED, font=("Segoe UI", 10, "italic")
+             ).pack(anchor="w", pady=(0, 12))
+
+    # -- URL
+    label(ig_inner, "INSTAGRAM URL", size=8, bold=True).pack(anchor="w")
+    ig_url_var = tk.StringVar()
+    ig_url_entry = tk.Entry(ig_inner, textvariable=ig_url_var, bg=FIELD, fg=TEXT,
+                            insertbackground=INSTA, relief="flat",
+                            font=("Segoe UI", 11), highlightthickness=1,
+                            highlightbackground=BORDER, highlightcolor=INSTA)
+    ig_url_entry.pack(fill="x", ipady=7, pady=(4, 18))
+
+    # -- Save location
+    label(ig_inner, "SAVE LOCATION", size=8, bold=True).pack(anchor="w")
+    ig_dir_row = tk.Frame(ig_inner, bg=CARD)
+    ig_dir_row.pack(fill="x", pady=(6, 16))
+    ig_dir_var = tk.StringVar(value=default_insta_dir())
+    tk.Entry(ig_dir_row, textvariable=ig_dir_var, bg=FIELD, fg=TEXT,
+             insertbackground=INSTA, relief="flat",
+             font=("Segoe UI", 10), highlightthickness=1,
+             highlightbackground=BORDER, highlightcolor=INSTA
+             ).pack(side="left", fill="x", expand=True, ipady=6)
+
+    def ig_browse():
+        d = filedialog.askdirectory(initialdir=ig_dir_var.get() or default_insta_dir(),
+                                    title="Choose where to save Instagram videos")
+        if d:
+            ig_dir_var.set(d)
+            save_settings(insta_out_dir=d)
+            ig_log("Save location set to: " + d)
+
+    def ig_open_folder():
+        p = ig_dir_var.get().strip()
+        if not p or not os.path.isdir(p):
+            ig_log("That folder doesn't exist yet.")
+            return
+        _open_folder(p)
+
+    tk.Button(ig_dir_row, text="Browse…", command=ig_browse, relief="flat", bd=0,
+              cursor="hand2", bg=FIELD, fg=TEXT, padx=14, pady=6,
+              activebackground=BORDER, activeforeground=TEXT,
+              font=("Segoe UI", 10)).pack(side="left", padx=(8, 0))
+    tk.Button(ig_dir_row, text="Open", command=ig_open_folder, relief="flat", bd=0,
+              cursor="hand2", bg=FIELD, fg=MUTED, padx=12, pady=6,
+              activebackground=BORDER, activeforeground=TEXT,
+              font=("Segoe UI", 10)).pack(side="left", padx=(6, 0))
+
+    # -- Action row
+    ig_action = tk.Frame(ig_inner, bg=CARD)
+    ig_action.pack(fill="x", pady=(0, 14))
+
+    ig_tl_var = tk.BooleanVar(value=bool(settings.get("to_timeline", True)))
+    tk.Checkbutton(ig_action, text="  Also append to current timeline",
+                   variable=ig_tl_var, bg=CARD, fg=TEXT, selectcolor=FIELD,
+                   activebackground=CARD, activeforeground=TEXT, bd=0,
+                   highlightthickness=0, anchor="w",
+                   font=("Segoe UI", 10),
+                   ).pack(side="left")
+
+    tk.Button(ig_action, text="Close", command=root.destroy, relief="flat",
+              bd=0, cursor="hand2", bg=CARD, fg=MUTED, padx=16, pady=9,
+              activebackground=CARD, activeforeground=TEXT,
+              font=("Segoe UI", 10)).pack(side="right", padx=(8, 0))
+
+    ig_go_btn = tk.Button(ig_action, text="Download & Add", relief="flat", bd=0,
+                          cursor="hand2", bg=INSTA, fg="#ffffff", padx=22, pady=9,
+                          activebackground="#9c2f6e", activeforeground="#ffffff",
+                          font=("Segoe UI", 10, "bold"))
+    ig_go_btn.pack(side="right")
+
+    # -- Progress
+    ig_prog_wrap = tk.Frame(ig_inner, bg=FIELD, height=6,
+                            highlightbackground=BORDER, highlightthickness=1)
+    ig_prog_wrap.pack(fill="x")
+    ig_prog_wrap.pack_propagate(False)
+    ig_prog_bar = tk.Frame(ig_prog_wrap, bg=INSTA, width=0)
+    ig_prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
+
+    ig_status_var = tk.StringVar(value="Ready")
+    tk.Label(ig_inner, textvariable=ig_status_var, bg=CARD, fg=MUTED,
+             font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 4))
+
+    def ig_set_progress(pct):
+        ig_prog_bar.place_configure(relwidth=max(0.0, min(pct, 100.0)) / 100.0)
+        ig_status_var.set("Downloading… %.1f%%" % pct)
+
+    # -- Log
+    ig_log_box = tk.Text(ig_inner, height=10, bg=FIELD, fg="#b9c0d0", bd=0,
+                         relief="flat", font=("Consolas", 9),
+                         insertbackground=INSTA, highlightthickness=1,
+                         highlightbackground=BORDER, wrap="word")
+    ig_log_box.pack(fill="both", expand=True)
+
+    def ig_log(msg):
+        ig_log_box.insert("end", str(msg) + "\n")
+        ig_log_box.see("end")
+
+    def ig_start():
+        url = ig_url_var.get().strip()
+        out_dir = ig_dir_var.get().strip()
+        if not url:
+            ig_status_var.set("Paste an Instagram URL first")
+            ig_log("Please paste an Instagram URL first.")
+            return
+        ig_go_btn.config(state="disabled", bg=BORDER, text="Working…")
+        ig_set_progress(0.0)
+
+        def finish():
+            ig_go_btn.config(state="normal", bg=INSTA, text="Download & Add")
+            ig_status_var.set("Ready")
+
+        def worker():
+            run_job(url, None, out_dir, ig_tl_var.get(),
+                    lambda m: root.after(0, ig_log, m),
+                    lambda p: root.after(0, ig_set_progress, p),
+                    platform="instagram")
+            root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    ig_go_btn.config(command=ig_start)
+    ig_log("Saving to: " + ig_dir_var.get())
+
+    # ---------------------------------------------------------------- initial paint
+    paint_tabs()
+    switch_tab("youtube")   # start on YouTube tab
+
     root.mainloop()
+
+
+def _open_folder(p):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(p)  # type: ignore
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", p])
+        else:
+            subprocess.Popen(["xdg-open", p])
+    except Exception as exc:
+        print("Could not open folder: %s" % exc)
 
 
 def main():
